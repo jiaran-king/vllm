@@ -451,64 +451,52 @@ def test_pooled_connections_are_retired_before_the_server_closes_them(
         asyncio.run(proxy.on_shutdown())
 
 
-@pytest.fixture
-def video_audio_metadata():
-    from vllm.distributed.ec_transfer.ec_connector.utils import collect_ec_item_metadata
-
-    # Feature indices refer to the processed video/audio, not content items.
-    features = [
-        SimpleNamespace(
-            identifier="video-derived",
-            modality="video",
-            data=SimpleNamespace(get_data=lambda: {"video_grid_thw": [2, 2, 2]}),
-        ),
-        SimpleNamespace(identifier="audio-derived", modality="audio", data=None),
-    ]
-    resolver = SimpleNamespace(fields_for=lambda modality: {"video_grid_thw"})
-    return collect_ec_item_metadata(features, resolver)
-
-
-@pytest.mark.parametrize("no_rewrite", [False, True])
-def test_video_audio_singleton_keeps_raw_pd_input(
-    proxy, monkeypatch, video_audio_metadata, no_rewrite
-):
-    """Fallback preserves raw video without disturbing neighboring image metadata."""
+@pytest.mark.parametrize(
+    "no_rewrite, transfer",
+    [(False, None), (True, None), (False, "push"), (False, "handle")],
+)
+def test_video_audio_fallback(proxy, monkeypatch, no_rewrite, transfer):
+    """Keep raw video and neighboring images, but never discard transfer handles."""
     import copy
 
+    from vllm.distributed.ec_transfer.ec_connector.utils import collect_ec_item_metadata
+
     video = {"type": "video_url", "video_url": {"url": "video-with-audio"}}
-    images = [{"type": "image_url", "image_url": {"url": x}} for x in ("A", "B")]
+    images = [{"type": "image_url", "image_url": {"url": key}} for key in ("A", "B")]
     body = {
-        "messages": [{"role": "user", "content": [images[0], video, images[1]]}],
+        "messages": [{"content": [images[0], video, images[1]]}],
         "mm_processor_kwargs": {"use_audio_in_video": True},
     }
     original = copy.deepcopy(body)
+    # Collector indices describe two processed features from one video item.
+    video_metadata = collect_ec_item_metadata(
+        [SimpleNamespace(identifier=key, data=None) for key in ("video", "audio")], None
+    )
+    if transfer == "handle":
+        video_metadata["audio"]["transfer_id"] = "reservation"
     image_metadata = {
-        key: {"metadata": {"image_grid_thw": [1, 2, size]}, "item_indices": [index]}
-        for index, (key, size) in enumerate((("A", 2), ("B", 4)))
+        key: {"metadata": {"image_grid_thw": [1, 2, size]}, "item_indices": [i]}
+        for i, (key, size) in enumerate((("A", 2), ("B", 4)))
     }
-    # One encoder: images A/B form the first group, video the second.
+    # Images form the first group, the singleton video the second.
     monkeypatch.setattr(proxy, "ENCODER_MAX_BATCH_SIZE", 0)
     monkeypatch.setattr(proxy, "NO_REWRITE", no_rewrite)
-    monkeypatch.setattr(
-        proxy,
-        "encode_session",
-        _EncoderSession(
-            [
-                image_metadata,
-                video_audio_metadata,
-            ]
-        ),
-    )
-    prepared, _, _ = asyncio.run(
-        proxy.prepare_for_decode(body, "r", ["http://e0"], "", None)
-    )
+    replies = _EncoderSession([image_metadata, video_metadata])
+    monkeypatch.setattr(proxy, "encode_session", replies)
+    consumer = "tcp://consumer:1" if transfer == "push" else None
+    preparation = proxy.prepare_for_decode(body, "r", ["http://e0"], "", consumer)
+    if transfer:
+        with pytest.raises(proxy.HTTPException, match="cannot be matched"):
+            asyncio.run(preparation)
+        return
+
+    prepared, _, _ = asyncio.run(preparation)
     assert body == original
+    assert prepared["mm_processor_kwargs"] == body["mm_processor_kwargs"]
     final = prepared["messages"][0]["content"]
     assert final[1] == video
-    assert prepared["mm_processor_kwargs"] == body["mm_processor_kwargs"]
     handles = prepared["ec_transfer_params"]
-    assert "video-derived" not in handles
-    assert "audio-derived" not in handles
+    assert not video_metadata.keys() & handles.keys()
     if no_rewrite:
         assert final == original["messages"][0]["content"]
         assert "ec_items" not in handles
@@ -520,37 +508,3 @@ def test_video_audio_singleton_keeps_raw_pd_input(
                 "uuid": proxy.content_uuid(image),
             }
         assert [item["mm_hash"] for item in handles["ec_items"]] == ["A", "B"]
-
-
-@pytest.mark.parametrize("transfer", ["push", "handle"])
-def test_video_audio_fallback_does_not_discard_transfers(
-    proxy, monkeypatch, video_audio_metadata, transfer
-):
-    if transfer == "handle":
-        video_audio_metadata["audio-derived"]["transfer_id"] = "reservation"
-    body = {
-        "messages": [
-            {
-                "content": [
-                    {
-                        "type": "video_url",
-                        "video_url": {"url": "video-with-audio"},
-                    }
-                ]
-            }
-        ],
-        "mm_processor_kwargs": {"use_audio_in_video": True},
-    }
-    monkeypatch.setattr(
-        proxy, "encode_session", _EncoderSession([video_audio_metadata])
-    )
-    with pytest.raises(proxy.HTTPException, match="cannot be matched"):
-        asyncio.run(
-            proxy.prepare_for_decode(
-                body,
-                "r",
-                ["http://e0"],
-                "",
-                "tcp://consumer:1" if transfer == "push" else None,
-            )
-        )
