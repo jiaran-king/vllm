@@ -449,3 +449,108 @@ def test_pooled_connections_are_retired_before_the_server_closes_them(
         assert proxy.decode_session.connector._keepalive_timeout == pooled_for
     finally:
         asyncio.run(proxy.on_shutdown())
+
+
+@pytest.fixture
+def video_audio_metadata():
+    from vllm.distributed.ec_transfer.ec_connector.utils import collect_ec_item_metadata
+
+    # Feature indices refer to the processed video/audio, not content items.
+    features = [
+        SimpleNamespace(
+            identifier="video-derived",
+            modality="video",
+            data=SimpleNamespace(get_data=lambda: {"video_grid_thw": [2, 2, 2]}),
+        ),
+        SimpleNamespace(identifier="audio-derived", modality="audio", data=None),
+    ]
+    resolver = SimpleNamespace(fields_for=lambda modality: {"video_grid_thw"})
+    return collect_ec_item_metadata(features, resolver)
+
+
+@pytest.mark.parametrize("no_rewrite", [False, True])
+def test_video_audio_singleton_keeps_raw_pd_input(
+    proxy, monkeypatch, video_audio_metadata, no_rewrite
+):
+    """Fallback preserves raw video without disturbing neighboring image metadata."""
+    import copy
+
+    video = {"type": "video_url", "video_url": {"url": "video-with-audio"}}
+    images = [{"type": "image_url", "image_url": {"url": x}} for x in ("A", "B")]
+    body = {
+        "messages": [{"role": "user", "content": [images[0], video, images[1]]}],
+        "mm_processor_kwargs": {"use_audio_in_video": True},
+    }
+    original = copy.deepcopy(body)
+    image_metadata = {
+        key: {"metadata": {"image_grid_thw": [1, 2, size]}, "item_indices": [index]}
+        for index, (key, size) in enumerate((("A", 2), ("B", 4)))
+    }
+    # One encoder: images A/B form the first group, video the second.
+    monkeypatch.setattr(proxy, "ENCODER_MAX_BATCH_SIZE", 0)
+    monkeypatch.setattr(proxy, "NO_REWRITE", no_rewrite)
+    monkeypatch.setattr(
+        proxy,
+        "encode_session",
+        _EncoderSession(
+            [
+                image_metadata,
+                video_audio_metadata,
+            ]
+        ),
+    )
+    prepared, _, _ = asyncio.run(
+        proxy.prepare_for_decode(body, "r", ["http://e0"], "", None)
+    )
+    assert body == original
+    final = prepared["messages"][0]["content"]
+    assert final[1] == video
+    assert prepared["mm_processor_kwargs"] == body["mm_processor_kwargs"]
+    handles = prepared["ec_transfer_params"]
+    assert "video-derived" not in handles
+    assert "audio-derived" not in handles
+    if no_rewrite:
+        assert final == original["messages"][0]["content"]
+        assert "ec_items" not in handles
+    else:
+        for position, image, key in ((0, images[0], "A"), (2, images[1], "B")):
+            assert final[position] == {
+                "type": "image_embeds",
+                "image_embeds": image_metadata[key]["metadata"],
+                "uuid": proxy.content_uuid(image),
+            }
+        assert [item["mm_hash"] for item in handles["ec_items"]] == ["A", "B"]
+
+
+@pytest.mark.parametrize("transfer", ["push", "handle"])
+def test_video_audio_fallback_does_not_discard_transfers(
+    proxy, monkeypatch, video_audio_metadata, transfer
+):
+    if transfer == "handle":
+        video_audio_metadata["audio-derived"]["transfer_id"] = "reservation"
+    body = {
+        "messages": [
+            {
+                "content": [
+                    {
+                        "type": "video_url",
+                        "video_url": {"url": "video-with-audio"},
+                    }
+                ]
+            }
+        ],
+        "mm_processor_kwargs": {"use_audio_in_video": True},
+    }
+    monkeypatch.setattr(
+        proxy, "encode_session", _EncoderSession([video_audio_metadata])
+    )
+    with pytest.raises(proxy.HTTPException, match="cannot be matched"):
+        asyncio.run(
+            proxy.prepare_for_decode(
+                body,
+                "r",
+                ["http://e0"],
+                "",
+                "tcp://consumer:1" if transfer == "push" else None,
+            )
+        )
